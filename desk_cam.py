@@ -5,6 +5,7 @@ import base64
 import http.server
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -14,14 +15,21 @@ import urllib.parse
 import urllib.request
 import webbrowser
 
-DEFAULT_OUT = os.path.expanduser(
-    os.environ.get("DESK_CAM_OUT") or os.environ.get("LEARNING_INBOX") or "~/desk-cam"
-)
-DEFAULT_PORT = int(os.environ.get("DESK_CAM_PORT", "8765"))
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+DEFAULT_OUT = os.path.expanduser(os.environ.get("DESK_CAM_OUT") or "~/desk-cam")
+DEFAULT_PORT = _env_int("DESK_CAM_PORT", 8765)
 DEFAULT_PROVIDER = os.environ.get("DESK_CAM_PROVIDER", "auto")
 DEFAULT_MODEL = os.environ.get("DESK_CAM_MODEL", "")
 DEFAULT_FILE = os.environ.get("DESK_CAM_FILE", "work.md")
 MAX_BYTES = 15 * 1024 * 1024
+MODEL_RE = re.compile(r"^[A-Za-z0-9._:/-]+$")
 
 OUT_DIR = DEFAULT_OUT
 OUT_FILE = DEFAULT_FILE
@@ -319,6 +327,10 @@ function setCurrentPhoto(name, url) {
   currentPhotoUrl = url || '';
 }
 
+function escHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function renderPreview() {
   const raw = md.value;
   $('cursor-info').textContent = `${raw.length} chars`;
@@ -329,11 +341,16 @@ function renderPreview() {
   if (window.marked) {
     const math = [];
     const safe = raw
-      .replace(/\$\$([\s\S]+?)\$\$/g, (_, m) => { math.push('$$' + m + '$$'); return `@@MATH${math.length - 1}@@`; })
-      .replace(/\$([^\n$]+?)\$/g, (_, m) => { math.push('$' + m + '$'); return `@@MATH${math.length - 1}@@`; });
+      .replace(/</g, '&lt;')
+      .replace(/\$\$([\s\S]+?)\$\$/g, (_, m) => { math.push('$$' + escHtml(m) + '$$'); return `@@MATH${math.length - 1}@@`; })
+      .replace(/\$([^\n$]+?)\$/g, (_, m) => { math.push('$' + escHtml(m) + '$'); return `@@MATH${math.length - 1}@@`; });
     let html = window.marked.parse(safe, { breaks: true, gfm: true });
     html = html.replace(/@@MATH(\d+)@@/g, (_, i) => math[+i]);
     preview.innerHTML = html;
+    preview.querySelectorAll('a[href]').forEach(a => {
+      const href = (a.getAttribute('href') || '').trim().toLowerCase();
+      if (!/^(https?:|mailto:|#)/.test(href)) a.removeAttribute('href');
+    });
   } else {
     preview.textContent = raw;
   }
@@ -395,7 +412,7 @@ async function startCam(id) {
 
 async function listCams() {
   const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
-  dev.innerHTML = cams.map(c => `<option value="${c.deviceId}">${c.label || 'Camera'}</option>`).join('');
+  dev.replaceChildren(...cams.map(c => new Option(c.label || 'Camera', c.deviceId)));
   return cams;
 }
 
@@ -545,13 +562,17 @@ async function confirmWork() {
   });
   const data = await res.json();
   if (!res.ok) { log(data.error || 'Save failed.', 'err'); return; }
-  if (navigator.clipboard) navigator.clipboard.writeText(text).catch(() => {});
+  let copied = Boolean(data.copied);
+  if (!copied && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(text); copied = true; } catch (_) {}
+  }
   setCurrentPhoto('', '');
   setLeftTab('cam');
   ocrBadge.textContent = 'saved';
   ocrBadge.className = 'badge ok';
-  const note = data.overwrote ? ' (replaced previous unread file)' : '';
-  log(`Saved ${data.workPath} & copied to clipboard${note}.`, 'ok');
+  const clip = copied ? ' & copied to clipboard' : '';
+  const note = data.overwrote ? ' (replaced previous file)' : '';
+  log(`Saved ${data.workPath}${clip}${note}.`, 'ok');
 }
 
 async function discardWork() {
@@ -666,7 +687,7 @@ init().catch(e => log('Camera error: ' + e.message + ' (use Upload or editor)', 
 
 
 def _copy_clipboard(text: str) -> bool:
-    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+    for cmd in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"], ["clip"]):
         if shutil.which(cmd[0]):
             try:
                 subprocess.run(cmd, input=text.encode("utf-8"), check=True)
@@ -674,6 +695,37 @@ def _copy_clipboard(text: str) -> bool:
             except Exception:
                 pass
     return False
+
+
+def _validated_http_url(raw: str, env_name: str) -> str:
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ValueError(f"{env_name} must be an http:// or https:// URL")
+    return raw.rstrip("/")
+
+
+def _validated_model(model: str) -> str:
+    if not model or not MODEL_RE.match(model):
+        raise ValueError("Invalid model ID")
+    return model
+
+
+def has_credentials(provider: str = PROVIDER) -> bool:
+    if provider == "gemini":
+        return bool(os.environ.get("GEMINI_API_KEY", "").strip())
+    if provider == "openai":
+        return bool(os.environ.get("OPENAI_API_KEY", "").strip())
+    if provider == "anthropic":
+        return bool(os.environ.get("ANTHROPIC_API_KEY", "").strip())
+    if provider == "ollama":
+        return True
+    if any(os.environ.get(k, "").strip() for k in ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "OLLAMA_HOST")):
+        return True
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:11434/api/tags", timeout=1):
+            return True
+    except Exception:
+        return False
 
 
 def resolve_provider(provider: str = PROVIDER) -> str:
@@ -716,8 +768,9 @@ def _stream_gemini(key: str, model: str, b64: str, gen_cfg: dict):
         }],
         "generationConfig": gen_cfg,
     }
+    safe_model = urllib.parse.quote(_validated_model(model), safe="")
     req = urllib.request.Request(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:streamGenerateContent?alt=sse",
         data=json.dumps(payload).encode("utf-8"),
         headers={"x-goog-api-key": key, "Content-Type": "application/json"},
     )
@@ -734,7 +787,7 @@ def _stream_gemini(key: str, model: str, b64: str, gen_cfg: dict):
 
 
 def _stream_openai(key: str, model: str, b64: str):
-    base = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    base = _validated_http_url(os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"), "OPENAI_BASE_URL")
     payload = {
         "model": model,
         "stream": True,
@@ -798,7 +851,7 @@ def _stream_anthropic(key: str, model: str, b64: str):
 
 
 def _stream_ollama(model: str, b64: str):
-    host = (os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434").rstrip("/")
+    host = _validated_http_url(os.environ.get("OLLAMA_HOST") or "http://127.0.0.1:11434", "OLLAMA_HOST")
     payload = {
         "model": model,
         "stream": True,
@@ -847,10 +900,9 @@ def stream_transcribe_chunks(image_bytes: bytes):
                 yield {"done": True, "markdown": cleaned, "model": m}
                 return
             except urllib.error.HTTPError as e:
-                detail = e.read().decode("utf-8", errors="ignore")[:200]
-                last_err = RuntimeError(f"Gemini HTTP {e.code}: {detail}")
+                last_err = RuntimeError(f"Gemini HTTP {e.code}")
             except Exception as e:
-                last_err = e
+                last_err = RuntimeError(type(e).__name__)
             if sent_any:
                 raise last_err
         raise last_err or RuntimeError("Transcription failed")
@@ -889,7 +941,55 @@ def transcribe_sync(image_bytes: bytes) -> tuple[str, str]:
     return ("".join(full).strip("\u200b\ufeff \r\n\t") or "[Blank or unreadable page]"), used_model
 
 
+def _safe_out_path(name: str) -> str | None:
+    base = os.path.basename(name or "")
+    if not base or base in (".", ".."):
+        return None
+    out_real = os.path.realpath(OUT_DIR)
+    candidate = os.path.join(OUT_DIR, base)
+    if os.path.islink(candidate):
+        return None
+    cand_real = os.path.realpath(candidate)
+    if not cand_real.startswith(out_real + os.sep):
+        return None
+    return cand_real
+
+
+def _unique_snap_name() -> tuple[str, str]:
+    stem = time.strftime("snap-%Y%m%d-%H%M%S")
+    for idx in range(100):
+        suffix = f"-{idx}" if idx else ""
+        name = f"{stem}{suffix}.jpg"
+        path = os.path.join(OUT_DIR, name)
+        if not os.path.exists(path):
+            return name, path
+    raise RuntimeError("Could not allocate snapshot filename")
+
+
+class DeskCamServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(30)
+
+    def _allowed_host(self) -> bool:
+        host = (self.headers.get("Host") or "").strip().lower()
+        return host in {f"localhost:{PORT}", f"127.0.0.1:{PORT}", f"[::1]:{PORT}", "localhost", "127.0.0.1", "[::1]"}
+
+    def _read_length(self, max_bytes: int) -> int | None:
+        raw = self.headers.get("Content-Length")
+        if raw is None:
+            return None
+        try:
+            length = int(raw)
+        except ValueError:
+            return None
+        return length if 0 < length <= max_bytes else None
+
     def send_json(self, code: int, obj: dict):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
@@ -909,11 +1009,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             for ev in stream_transcribe_chunks(image_bytes):
                 self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode("utf-8"))
                 self.wfile.flush()
+        except urllib.error.HTTPError as e:
+            self.wfile.write(f"data: {json.dumps({'error': f'Provider HTTP {e.code}'})}\n\n".encode("utf-8"))
+            self.wfile.flush()
         except Exception as exc:
             self.wfile.write(f"data: {json.dumps({'error': str(exc)})}\n\n".encode("utf-8"))
             self.wfile.flush()
 
     def do_GET(self):
+        if not self._allowed_host():
+            self.send_error(403, "Forbidden host")
+            return
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
@@ -925,14 +1031,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "outFile": OUT_FILE,
                 "provider": prov,
                 "model": active_model(prov, MODEL),
+                "configured": has_credentials(PROVIDER),
                 "frontmatter": FRONTMATTER,
             })
             return
 
         if parsed.path == "/file":
             name = os.path.basename((qs.get("name") or [""])[0])
-            target = os.path.join(OUT_DIR, name)
-            if not (name and name.endswith((".jpg", ".jpeg", ".png", ".md")) and os.path.isfile(target)):
+            target = _safe_out_path(name)
+            if not (target and name.endswith((".jpg", ".jpeg", ".png", ".md")) and os.path.isfile(target)):
                 self.send_error(404)
                 return
             ctype = "text/markdown; charset=utf-8" if name.endswith(".md") else "image/jpeg"
@@ -950,30 +1057,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(PAGE)
 
     def do_POST(self):
+        if not self._allowed_host():
+            self.send_json(403, {"error": "Forbidden host"})
+            return
         origin = self.headers.get("Origin")
-        if origin and origin not in (f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"):
+        if origin and origin not in (f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}", f"http://[::1]:{PORT}"):
             self.send_json(403, {"error": "Forbidden origin"})
+            return
+        sfs = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if sfs and sfs not in ("same-origin", "none"):
+            self.send_json(403, {"error": "Forbidden cross-site request"})
             return
         parsed = urllib.parse.urlparse(self.path)
         qs = urllib.parse.parse_qs(parsed.query)
 
         if parsed.path == "/capture":
-            length = int(self.headers.get("Content-Length", 0))
-            if not 0 < length <= MAX_BYTES:
+            length = self._read_length(MAX_BYTES)
+            if length is None:
                 self.send_json(400, {"error": "Invalid body size"})
                 return
             data = self.rfile.read(length)
-            if not data.startswith(b"\xff\xd8"):
+            if len(data) != length or not data.startswith(b"\xff\xd8"):
                 self.send_json(400, {"error": "Expected JPEG"})
                 return
             os.makedirs(OUT_DIR, exist_ok=True)
             replace = os.path.basename((qs.get("replace") or [""])[0])
             if replace.startswith("snap-") and replace.endswith(".jpg"):
-                old_path = os.path.join(OUT_DIR, replace)
-                if os.path.isfile(old_path):
+                old_path = _safe_out_path(replace)
+                if old_path and os.path.isfile(old_path):
                     os.remove(old_path)
-            name = time.strftime("snap-%Y%m%d-%H%M%S.jpg")
-            path = os.path.join(OUT_DIR, name)
+            name, path = _unique_snap_name()
             with open(path, "wb") as f:
                 f.write(data)
             print(path, flush=True)
@@ -982,8 +1095,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/transcribe":
             name = os.path.basename((qs.get("name") or [""])[0])
-            target = os.path.join(OUT_DIR, name)
-            if not (name.startswith("snap-") and name.endswith(".jpg") and os.path.isfile(target)):
+            target = _safe_out_path(name)
+            if not (target and name.startswith("snap-") and name.endswith(".jpg") and os.path.isfile(target)):
                 self.send_json(404, {"error": "Photo not found"})
                 return
             with open(target, "rb") as f:
@@ -994,13 +1107,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             try:
                 md_text, used_model = transcribe_sync(data)
                 self.send_json(200, {"markdown": md_text, "model": used_model})
+            except urllib.error.HTTPError as e:
+                self.send_json(502, {"error": f"Provider HTTP {e.code}"})
             except Exception as exc:
                 self.send_json(500, {"error": str(exc)})
             return
 
         if parsed.path == "/confirm":
-            length = int(self.headers.get("Content-Length", 0))
-            if not 0 < length <= 2 * 1024 * 1024:
+            length = self._read_length(2 * 1024 * 1024)
+            if length is None:
                 self.send_json(400, {"error": "Invalid payload"})
                 return
             try:
@@ -1014,19 +1129,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             photo_name = os.path.basename(payload.get("photoName") or "")
             os.makedirs(OUT_DIR, exist_ok=True)
-            work_path = os.path.join(OUT_DIR, OUT_FILE)
+            work_path = _safe_out_path(OUT_FILE)
+            if not work_path:
+                self.send_json(400, {"error": "Invalid output path"})
+                return
             overwrote = os.path.isfile(work_path)
             if FRONTMATTER:
                 ts = time.strftime("%Y-%m-%d %H:%M:%S")
-                doc = f"---\nstatus: ready\nverified_by_learner: true\ncaptured_at: {ts}\n---\n\n{markdown}\n"
+                doc = f"---\ncaptured_at: {ts}\n---\n\n{markdown}\n"
             else:
                 doc = f"{markdown}\n"
             with open(work_path, "w", encoding="utf-8") as f:
                 f.write(doc)
             copied = _copy_clipboard(markdown)
             if photo_name.startswith("snap-") and photo_name.endswith(".jpg"):
-                photo_path = os.path.join(OUT_DIR, photo_name)
-                if os.path.isfile(photo_path):
+                photo_path = _safe_out_path(photo_name)
+                if photo_path and os.path.isfile(photo_path):
                     os.remove(photo_path)
             print(f"saved -> {work_path}", flush=True)
             self.send_json(200, {"ok": True, "workPath": work_path, "copied": copied, "overwrote": overwrote})
@@ -1034,8 +1152,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if parsed.path == "/delete":
             name = os.path.basename((qs.get("name") or [""])[0])
-            target = os.path.join(OUT_DIR, name)
-            if name and (name == OUT_FILE or (name.startswith("snap-") and name.endswith(".jpg"))) and os.path.isfile(target):
+            target = _safe_out_path(name)
+            if target and (name == OUT_FILE or (name.startswith("snap-") and name.endswith(".jpg"))) and os.path.isfile(target):
                 os.remove(target)
                 self.send_json(200, {"deleted": name})
                 return
@@ -1066,7 +1184,22 @@ def main(argv=None):
     MODEL = args.model
     FRONTMATTER = args.frontmatter
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    if MODEL:
+        _validated_model(MODEL)
+
+    try:
+        server = DeskCamServer(("127.0.0.1", PORT), Handler)
+    except OSError as exc:
+        print(f"desk-cam: cannot bind 127.0.0.1:{PORT} ({exc}). Try --port {PORT + 1}.", file=sys.stderr)
+        sys.exit(1)
+
+    if not has_credentials(PROVIDER):
+        print(
+            "desk-cam: warning - no vision API key or Ollama detected. "
+            "Set GEMINI_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY, or start Ollama; manual Markdown editing still works.",
+            file=sys.stderr,
+        )
+
     url = f"http://localhost:{PORT}"
     print(f"desk-cam: {url} -> {os.path.join(OUT_DIR, OUT_FILE)}  (Ctrl-C to stop)", flush=True)
     if not args.no_open:

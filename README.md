@@ -8,7 +8,7 @@ Zero-dependency CLI tool that turns any webcam, document camera, or iPhone (Cont
 - **Rotate anywhere**: Rotate 90° while live or after capturing a sideways page.
 - **Streaming OCR to Markdown + LaTeX**: Streams verbatim transcription into a split **Editor** and live **KaTeX Preview**. Marks crossed-out text (`~~...~~`) and unclear symbols (`[?]`) without silently "fixing" your mistakes.
 - **Multi-provider (`auto`, zero dependencies)**: Uses `GEMINI_API_KEY`, `OPENAI_API_KEY` (supports `OPENAI_BASE_URL`), `ANTHROPIC_API_KEY`, or local `ollama`.
-- **Save & copy (`Cmd+Enter` / `Ctrl+Enter`)**: Writes clean Markdown to disk, copies to your clipboard (`pbcopy`, `wl-copy`, or `xclip`), and removes the temporary JPEG.
+- **Save & copy (`Cmd+Enter` / `Ctrl+Enter`)**: Writes clean Markdown to disk, copies to your clipboard (`pbcopy`, `wl-copy`, `xclip`, `xsel`, or `clip` on Windows, with browser clipboard fallback), and removes the temporary JPEG.
 
 ## Install
 
@@ -41,9 +41,9 @@ Options:
 | `--out DIR` | `~/desk-cam` (or `DESK_CAM_OUT`) | Output folder |
 | `--file NAME` | `work.md` (or `DESK_CAM_FILE`) | Output Markdown filename |
 | `--port PORT` | `8765` (or `DESK_CAM_PORT`) | Local HTTP port |
-| `--provider` | `auto` (`gemini`, `openai`, `anthropic`, `ollama`) | Vision backend |
+| `--provider` | `auto` (or `DESK_CAM_PROVIDER`) | `auto`, `gemini`, `openai`, `anthropic`, `ollama` |
 | `--model ID` | Provider default (or `DESK_CAM_MODEL`) | Override model ID |
-| `--frontmatter` | off | Add YAML frontmatter (`status`, `captured_at`) |
+| `--frontmatter` | off | Prepend `captured_at` YAML frontmatter |
 | `--no-open` | off | Do not open a browser tab automatically |
 
 ## Shortcuts

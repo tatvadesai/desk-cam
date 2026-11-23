@@ -87,16 +87,26 @@ class DeskCamTests(unittest.TestCase):
             self.assertEqual(f.read(), "$x^2 + 1$\n")
 
         desk_cam.FRONTMATTER = True
+        s1 = os.path.join(self.tmpdir, "snap-20260101-000001.jpg")
+        s2 = os.path.join(self.tmpdir, "snap-20260101-000002.jpg")
+        for s in (s1, s2):
+            with open(s, "wb") as f:
+                f.write(b"\xff\xd8test")
         with mock.patch.object(desk_cam, "_copy_clipboard", return_value=True):
             req2 = urllib.request.Request(
                 f"http://127.0.0.1:{self.port}/confirm",
-                data=json.dumps({"markdown": "$y = 2x$"}).encode(),
+                data=json.dumps({
+                    "markdown": "$y = 2x$",
+                    "photoNames": ["snap-20260101-000001.jpg", "snap-20260101-000002.jpg"],
+                }).encode(),
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
             with urllib.request.urlopen(req2) as r:
                 res2 = json.loads(r.read())
         self.assertTrue(res2["overwrote"])
+        self.assertFalse(os.path.exists(s1))
+        self.assertFalse(os.path.exists(s2))
         with open(os.path.join(self.tmpdir, "work.md"), encoding="utf-8") as f:
             body = f.read()
         self.assertIn("captured_at:", body)

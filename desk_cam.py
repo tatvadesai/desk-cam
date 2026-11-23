@@ -207,6 +207,7 @@ input[type=file]{display:none}
         <img id="snap-img" alt="Captured page">
       </div>
       <div class="cam-actions" id="photo-actions" style="display:none">
+        <button id="add-page" class="run" title="Scan another page and append it">+ Append page</button>
         <button id="retake">Retake</button>
         <button id="retranscribe">Re-transcribe</button>
         <span class="spacer"></span>
@@ -264,7 +265,15 @@ let stream = null;
 let idleTimer = null;
 let currentPhotoName = sessionStorage.currentPhotoName || '';
 let currentPhotoUrl = currentPhotoName ? '/file?name=' + encodeURIComponent(currentPhotoName) : '';
+let pageNames = currentPhotoName ? [currentPhotoName] : [];
 let activeTab = 'cam';
+let appendMode = false;
+
+function setAppendMode(on) {
+  appendMode = on;
+  const capBtn = $('cap');
+  capBtn.innerHTML = (on ? 'Append page ' : 'Capture ') + '<span class="kbd">Space</span>';
+}
 
 function log(text, kind = '') {
   statusLine.textContent = text;
@@ -430,13 +439,14 @@ async function ensureCam() {
   return camLive();
 }
 
-async function streamResponse(res, t0) {
+async function streamResponse(res, t0, prefix = '') {
   const reader = res.body.getReader();
   const dec = new TextDecoder();
   let buf = '';
   let text = '';
   let model = '';
-  md.value = '';
+  md.value = prefix;
+  renderPreview();
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -449,17 +459,18 @@ async function streamResponse(res, t0) {
         const msg = JSON.parse(line.slice(6));
         if (msg.error) throw new Error(msg.error);
         if (msg.name) {
+          if (!pageNames.includes(msg.name)) pageNames.push(msg.name);
           setCurrentPhoto(msg.name, '/file?name=' + encodeURIComponent(msg.name));
         }
         if (msg.delta) {
           text += msg.delta;
-          md.value = text;
+          md.value = prefix + text;
           renderPreview();
         }
         if (msg.done) {
           model = msg.model || model;
           if (msg.markdown !== undefined) {
-            md.value = msg.markdown;
+            md.value = prefix + msg.markdown;
             renderPreview();
           }
         }
@@ -469,7 +480,7 @@ async function streamResponse(res, t0) {
   const secs = ((performance.now() - t0) / 1000).toFixed(2);
   ocrBadge.textContent = `${model || 'ready'} (${secs}s)`;
   ocrBadge.className = 'badge ok';
-  log(`Transcribed in ${secs}s (${model}). Edit if needed, then Cmd+Enter.`, 'ok');
+  log(`Transcribed in ${secs}s (${model}). + Append page, or Cmd+Enter to save.`, 'ok');
   md.focus();
 }
 
@@ -484,7 +495,7 @@ async function transcribePhoto(name) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.error || 'Transcription failed');
     }
-    await streamResponse(res, t0);
+    await streamResponse(res, t0, '');
   } catch (err) {
     ocrBadge.textContent = 'manual';
     ocrBadge.className = 'badge';
@@ -492,22 +503,26 @@ async function transcribePhoto(name) {
   }
 }
 
-async function saveAndTranscribe(blob) {
+async function saveAndTranscribe(blob, opts = {}) {
+  const append = Boolean(opts.append);
+  const prefix = append && md.value.trim() ? md.value.trimEnd() + '\n\n---\n\n' : '';
   const localUrl = URL.createObjectURL(blob);
-  setCurrentPhoto(currentPhotoName || 'capturing...', localUrl);
+  const prevName = currentPhotoName;
+  setCurrentPhoto('capturing...', localUrl);
   setLeftTab('photo');
   ocrBadge.textContent = 'streaming...';
   ocrBadge.className = 'badge busy';
-  log('Capturing & transcribing...');
+  log(append ? 'Appending page & transcribing...' : 'Capturing & transcribing...');
   const t0 = performance.now();
   try {
-    const oldName = currentPhotoName && currentPhotoName.startsWith('snap-') ? currentPhotoName : '';
-    const res = await fetch('/capture' + (oldName ? '?replace=' + encodeURIComponent(oldName) : ''), { method: 'POST', body: blob });
+    const replaceName = !append && prevName && prevName.startsWith('snap-') ? prevName : '';
+    if (replaceName) pageNames = pageNames.filter(n => n !== replaceName);
+    const res = await fetch('/capture' + (replaceName ? '?replace=' + encodeURIComponent(replaceName) : ''), { method: 'POST', body: blob });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new Error(data.error || 'Capture failed');
     }
-    await streamResponse(res, t0);
+    await streamResponse(res, t0, prefix);
   } catch (err) {
     ocrBadge.textContent = 'manual';
     ocrBadge.className = 'badge';
@@ -527,17 +542,26 @@ async function rotateCapturedPhoto() {
     ctx.rotate(Math.PI / 2);
     ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
     const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
-    await saveAndTranscribe(blob);
+    await saveAndTranscribe(blob, { append: false });
   };
   img.src = currentPhotoUrl + (currentPhotoUrl.includes('?') ? '&' : '?') + 't=' + Date.now();
 }
 
 async function capture() {
-  if (!camLive()) {
-    log('Starting camera...', 'warn');
-    try { await ensureCam(); } catch (e) { log('Could not start camera: ' + e.message, 'err'); return; }
+  if (activeTab !== 'cam' || !camLive()) {
+    setLeftTab('cam');
+    log('Starting camera so you can aim...', 'warn');
+    try {
+      await ensureCam();
+      log('Camera live - aim page and press Space to capture.', 'ok');
+    } catch (e) {
+      log('Could not start camera: ' + e.message, 'err');
+    }
+    return;
   }
   if (!v.videoWidth) { log('Camera frame not ready yet.', 'warn'); return; }
+  const append = appendMode;
+  setAppendMode(false);
   const w = v.videoWidth, h = v.videoHeight, sideRot = rot % 180 !== 0;
   const s = Math.min(1, 1200 / Math.max(w, h));
   const c = document.createElement('canvas');
@@ -548,17 +572,18 @@ async function capture() {
   ctx.rotate(rot * Math.PI / 180);
   ctx.drawImage(v, -w * s / 2, -h * s / 2, w * s, h * s);
   const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.80));
-  stopCam('Camera paused after capture to save battery.');
-  await saveAndTranscribe(blob);
+  stopCam('Camera paused while transcribing.');
+  await saveAndTranscribe(blob, { append });
 }
 
 async function confirmWork() {
   const text = md.value.trim();
   if (!text) { log('Nothing to save yet.', 'warn'); return; }
+  const names = pageNames.slice();
   const res = await fetch('/confirm', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ markdown: text, photoName: currentPhotoName })
+    body: JSON.stringify({ markdown: text, photoName: currentPhotoName, photoNames: names })
   });
   const data = await res.json();
   if (!res.ok) { log(data.error || 'Save failed.', 'err'); return; }
@@ -566,25 +591,33 @@ async function confirmWork() {
   if (!copied && navigator.clipboard) {
     try { await navigator.clipboard.writeText(text); copied = true; } catch (_) {}
   }
+  pageNames = [];
+  setAppendMode(false);
   setCurrentPhoto('', '');
   setLeftTab('cam');
   ocrBadge.textContent = 'saved';
   ocrBadge.className = 'badge ok';
   const clip = copied ? ' & copied to clipboard' : '';
   const note = data.overwrote ? ' (replaced previous file)' : '';
-  log(`Saved ${data.workPath}${clip}${note}.`, 'ok');
+  ensureCam().then(() => {
+    log(`Saved ${data.workPath}${clip}${note}. Camera ready for next page.`, 'ok');
+  }).catch(() => {
+    log(`Saved ${data.workPath}${clip}${note}.`, 'ok');
+  });
 }
 
 async function discardWork() {
-  if (currentPhotoName) {
-    await fetch('/delete?name=' + encodeURIComponent(currentPhotoName), { method: 'POST' });
-  }
+  const names = pageNames.length ? pageNames.slice() : (currentPhotoName ? [currentPhotoName] : []);
+  await Promise.all(names.map(n => fetch('/delete?name=' + encodeURIComponent(n), { method: 'POST' }).catch(() => {})));
+  pageNames = [];
+  setAppendMode(false);
   setCurrentPhoto('', '');
   md.value = '';
   renderPreview();
   ocrBadge.textContent = 'idle';
   ocrBadge.className = 'badge';
   setLeftTab('cam');
+  ensureCam().catch(() => {});
   log('Discarded draft.');
 }
 
@@ -616,7 +649,13 @@ const toggleCam = () => {
 };
 camPill.onclick = toggleCam;
 camDot.onclick = toggleCam;
+$('add-page').onclick = () => {
+  setAppendMode(true);
+  setLeftTab('cam');
+  ensureCam().then(() => log('Aim next page and press Space to append.', 'ok')).catch(e => log('Camera error: ' + e.message, 'err'));
+};
 $('retake').onclick = () => {
+  setAppendMode(false);
   setLeftTab('cam');
   ensureCam().then(() => log('Align page and press Space to capture.', 'ok')).catch(e => log('Camera error: ' + e.message, 'err'));
 };
@@ -1127,7 +1166,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not markdown:
                 self.send_json(400, {"error": "Empty markdown"})
                 return
-            photo_name = os.path.basename(payload.get("photoName") or "")
+            names = list(payload.get("photoNames") or [])
+            if payload.get("photoName"):
+                names.append(payload.get("photoName"))
             os.makedirs(OUT_DIR, exist_ok=True)
             work_path = _safe_out_path(OUT_FILE)
             if not work_path:
@@ -1142,10 +1183,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with open(work_path, "w", encoding="utf-8") as f:
                 f.write(doc)
             copied = _copy_clipboard(markdown)
-            if photo_name.startswith("snap-") and photo_name.endswith(".jpg"):
-                photo_path = _safe_out_path(photo_name)
-                if photo_path and os.path.isfile(photo_path):
-                    os.remove(photo_path)
+            for raw_name in set(names):
+                photo_name = os.path.basename(str(raw_name))
+                if photo_name.startswith("snap-") and photo_name.endswith(".jpg"):
+                    photo_path = _safe_out_path(photo_name)
+                    if photo_path and os.path.isfile(photo_path):
+                        os.remove(photo_path)
             print(f"saved -> {work_path}", flush=True)
             self.send_json(200, {"ok": True, "workPath": work_path, "copied": copied, "overwrote": overwrote})
             return
